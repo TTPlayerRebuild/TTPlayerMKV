@@ -1,0 +1,86 @@
+name: Build Matroska audio plugin
+on:
+  workflow_dispatch:
+    inputs:
+      only_if_unreleased:
+        description: Skip when the commit is already released
+        type: boolean
+        default: false
+      release_a_version:
+        description: Release a Version (GitHub)
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: ${{ inputs.release_a_version && 'mkv-release' || format('mkv-build-{0}', github.run_id) }}
+  cancel-in-progress: false
+jobs:
+  release_check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ONLY_IF_UNRELEASED: ${{ inputs.only_if_unreleased }}
+          RELEASE_REQUESTED: ${{ inputs.release_a_version }}
+        run: python3 cmake/check_component_release.py
+  build:
+    needs: release_check
+    if: needs.release_check.outputs.should_build == 'true'
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Allocate date version before compilation
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE: ${{ inputs.release_a_version }}
+        run: |
+          $date = [DateTimeOffset]::UtcNow.ToOffset([TimeSpan]::FromHours(8)).ToString('yyyy.MM.dd')
+          $version = $date
+          if ($env:RELEASE -eq 'true') {
+            $json = gh api --paginate "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name'
+            if ($LASTEXITCODE -ne 0) { throw 'Cannot enumerate existing versions' }
+            $index = 0
+            while ($json -contains $version) { $index++; $version = "${date}p$index" }
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Build, audit and package runtime plus corresponding source
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          ./build.ps1 -Version $env:VERSION -Package -SourcePackage
+          New-Item -ItemType Directory artifact | Out-Null
+          Copy-Item "build/Release/ttp_mkv-$env:VERSION*.zip",build/Release/SHA256SUMS.txt -Destination artifact
+      # Private tests and media stay in rebuild/tests; no tests run in Action.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ttp_mkv-x86-${{ steps.version.outputs.version }}
+          path: artifact/
+          if-no-files-found: error
+      - name: Publish only when explicitly requested
+        if: inputs.release_a_version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "$env:VERSION" "artifact/ttp_mkv-$env:VERSION.zip" `
+            "artifact/ttp_mkv-$env:VERSION-source.zip" artifact/SHA256SUMS.txt `
+            --repo "$env:GITHUB_REPOSITORY" --target "$env:GITHUB_SHA" --title "$env:VERSION" `
+            --notes "MKV/MKA audio Reader. FFmpeg LGPL backend; complete corresponding source attached. See README and third_party/ORIGIN.md."
+          if ($LASTEXITCODE -ne 0) { throw 'Release failed; existing releases are not overwritten' }
